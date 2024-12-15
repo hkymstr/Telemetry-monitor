@@ -27,18 +27,18 @@ def read_adc(channel):
     result = bytearray(2)
     spi.write_readinto(bytearray([CHANNEL_SELECT[channel], 0x00]), result)
     cs.value = True  # Deselect the ADC
-
     # Combine the two bytes to form an 8-bit result
     adc_value = result[0]  # Only take the most significant 8 bits
     spi.unlock()
+    time.sleep(0.1)
     return adc_value
 
 def main():
     """Main loop to retrieve telemetry data every second."""
     while True:
         # Read all four channels and store the results in a tuple
+        telemetry = tuple(f"{read_adc(channel):08b}" for channel in range(4))
         telemetry = tuple(read_adc(channel) for channel in range(4))
-        print("Telemetry Data (Tuple):", telemetry)
         print((telemetry))
         print((random.randint(0, 100), random.randint(-100, 0), random.randint(-50, 50)))
         time.sleep(0.5)
