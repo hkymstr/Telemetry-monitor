@@ -2,71 +2,104 @@ import board
 import busio
 import digitalio
 import time
-import random
-# SPI setup
-spi = busio.SPI(clock=board.GP2, MOSI=board.GP3, MISO=board.GP4)  # Define SPI pins
-cs = digitalio.DigitalInOut(board.GP5)  # Chip Select pin
-cs.direction = digitalio.Direction.OUTPUT
-cs.value = True  # Keep CS high when not communicating
-# ADC Channel Selection Bits
 
-CHANNEL_SELECT = [0b0000_0000, 0b0000_1000, 0b0001_0000, 0b0001_1000]
+# Hardware Configuration
+SPI_CONFIG = {
+    'clock': board.GP2,
+    'mosi': board.GP3,
+    'miso': board.GP4,
+    'cs_pin': board.GP5,
+    'baudrate': 800000,
+    'polarity': 0,
+    'phase': 0,
+    'bits': 8
+}
 
-# CHANNEL_SELECT = [0b0000_0000, 0b0000_0000, 0b0000_0000, 0b0000_0000]
+# ADC Configuration
+ADC_CHANNELS = {
+    0: 0b00001000,
+    1: 0b00010000,
+    2: 0b00001000,
+    3: 0b00000000
+}
 
-# CHANNEL_SELECT = [0b0000_1000, 0b0000_1000, 0b0000_1000, 0b0000_1000]
-
-# CHANNEL_SELECT = [0b0001_0000, 0b0001_0000, 0b0001_0000, 0b0001_0000]
-
-# CHANNEL_SELECT = [0b0001_1000, 0b0001_1000, 0b0001_1000, 0b0001_1000]
-
-def read_adc(channel):
-    while not spi.try_lock():
-        pass
-    spi.configure(baudrate=3000000, polarity=0, phase=0, bits=8)
-    """Read a single channel from the ADC."""
-    if channel < 0 or channel > 3:
-        raise ValueError("Invalid channel. Must be 0-3.")
-    
-    # Send channel selection byte and read the ADC value in two 8-bit transactions
-    cs.value = False  # Select the ADC
-    result = bytearray(2)  # Buffer for the 16-bit result
-    spi.write_readinto(bytearray([CHANNEL_SELECT[channel], 0x00]), result)
-    cs.value = True  # Deselect the ADC
-
-    print("channel: ", channel)
-    print(result)
-    
-    # Get the middle 8 bits from the 16-bit result
-    adc_value = (result[0] & 0x0F) << 4 | (result[1] >> 4)
-    spi.unlock()
-    time.sleep(0.5)
-    
-    return adc_value
-    
-
+class ADCReader:
+    def __init__(self, spi_config):
+        """Initialize ADC reader with SPI configuration."""
+        self.spi = busio.SPI(
+            clock=spi_config['clock'],
+            MOSI=spi_config['mosi'],
+            MISO=spi_config['miso']
+        )
         
+        # Configure chip select pin
+        self.cs = digitalio.DigitalInOut(spi_config['cs_pin'])
+        self.cs.direction = digitalio.Direction.OUTPUT
+        self.cs.value = True  # Default CS high (disabled)
         
-def main():
-    """Main loop to retrieve telemetry data every second."""
-    while True:
-        # Read each channel individually and store the results in a list
-        telemetry = []
-        for channel in range(4):
-            value = read_adc(channel)
-            telemetry.append(value)
+        # Store SPI configuration
+        self.spi_config = spi_config
+
+    def read_channel(self, channel):
+        """Read value from specified ADC channel."""
+        if not 0 <= channel <= 3:
+            raise ValueError("Channel must be between 0 and 3")
+
+        # Acquire SPI bus
+        while not self.spi.try_lock():
+            pass
             
-            # Print the value for the current channel in hex and binary
-            hex_value = f"0x{value:04X}"  # Format the value as a 4-digit hexadecimal
-            bin_value = f"{value:08b}"  # Format the value as an 8-bit binary
-            print(f"Channel {channel}: Hex: {hex_value}, Binary: {bin_value}")
-        
-        print(f"Telemetry: {telemetry}")  # Print the complete telemetry list
-        print()  # Print a blank line for readability
-        
-        time.sleep(0.5)
-        
-        
-# Initialize SPI and run the main loop
-with spi:
-    main()  # Write your code here :-)
+        try:
+            # Configure SPI parameters
+            self.spi.configure(
+                baudrate=self.spi_config['baudrate'],
+                polarity=self.spi_config['polarity'],
+                phase=self.spi_config['phase'],
+                bits=self.spi_config['bits']
+            )
+            
+            # Prepare for reading
+            result = bytearray(2)
+            channel_select = ADC_CHANNELS[channel]
+            
+            # Perform SPI transaction
+            self.cs.value = False  # Enable ADC
+            self.spi.write_readinto(bytearray([channel_select, 0x00]), result)
+            self.cs.value = True   # Disable ADC
+            
+            # Extract and return 8-bit result
+            return (result[0] & 0x0F) << 4 | (result[1] >> 4)
+            
+        finally:
+            self.spi.unlock()
+            time.sleep(0.01)  # Brief delay between readings
+
+    def read_all_channels(self):
+        """Read values from all ADC channels."""
+        return [self.read_channel(channel) for channel in range(4)]
+
+def format_reading(channel, value):
+    """Format ADC reading for display."""
+    return (f"Channel {channel}:, Hex: 0x{value:04X}, Binary: {value:08b}, Decimal: {value}")
+
+def main():
+    """Main program loop."""
+    adc = ADCReader(SPI_CONFIG)
+    
+    try:
+        while True:
+            # Read all channels
+            readings = adc.read_all_channels()
+            
+            # Display readings
+            for channel, value in enumerate(readings):
+                print(format_reading(channel, value))
+            print()  # Blank line for readability
+            
+            time.sleep(0.5)
+            
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+
+if __name__ == "__main__":
+    main()
