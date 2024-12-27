@@ -61,7 +61,7 @@ class ADCReader:
                 print(f"Warning: Failed to initialize internal ADC on pin {pin}: {e}")
 
     def read_external_channel(self, channel):
-        """Read value from specified external ADC channel."""
+        """Read value from specified external ADC channel, handling pipelined behavior."""
         if not 0 <= channel <= 3:
             raise ValueError("Channel must be between 0 and 3")
             
@@ -78,14 +78,22 @@ class ADCReader:
                 bits=self.spi_config['bits']
             )
             
-            # Prepare for reading
+            # Start first conversion
             result = bytearray(2)
             channel_select = EXT_ADC_CHANNELS[channel]
             
-            # Perform SPI transaction
-            self.cs.value = False  # Enable ADC
+            # First transaction: Setup channel for next conversion
+            self.cs.value = False
             self.spi.write_readinto(bytearray([channel_select, 0x00]), result)
-            self.cs.value = True   # Disable ADC
+            self.cs.value = True
+            
+            # Brief delay for conversion
+            time.sleep(0.000001)  # 1 microsecond delay
+            
+            # Second transaction: Read the actual result from the channel
+            self.cs.value = False
+            self.spi.write_readinto(bytearray([channel_select, 0x00]), result)
+            self.cs.value = True
             
             # Extract and return 8-bit result
             return (result[0] & 0x0F) << 4 | (result[1] >> 4)
@@ -121,7 +129,9 @@ class ADCReader:
             return (value / 255) * 3.3
 
     def read_all_channels(self):
-        """Read values from all ADC channels (external and internal) and temperature."""
+        """Read values from all ADC channels (external and internal) and temperature.
+        Handles pipelined behavior of external ADC by performing an extra dummy read
+        at the start of the sequence."""
         readings = {
             'external': [],
             'internal': [],
