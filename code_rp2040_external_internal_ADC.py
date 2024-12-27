@@ -17,13 +17,12 @@ SPI_CONFIG = {
     'bits': 8
 }
 
-# External ADC Channel Configuration - MCP3004/3008
-# Format: 0b000xxxxx where xxx are channel select bits
+# External ADC Configuration
 EXT_ADC_CHANNELS = {
-    0: 0b10000000,  # Single-ended channel 0
-    1: 0b10010000,  # Single-ended channel 1
-    2: 0b10100000,  # Single-ended channel 2
-    3: 0b10110000   # Single-ended channel 3
+    0: 0b00000000,
+    1: 0b00001000,
+    2: 0b00010000,
+    3: 0b00011000
 }
 
 # Internal ADC pins
@@ -61,32 +60,10 @@ class ADCReader:
             except Exception as e:
                 print(f"Warning: Failed to initialize internal ADC on pin {pin}: {e}")
 
-        # Initialize external ADC with a dummy read
-        self._initialize_external_adc()
-
-    def _initialize_external_adc(self):
-        """Initialize external ADC with a dummy read."""
-        try:
-            while not self.spi.try_lock():
-                pass
-            self.spi.configure(
-                baudrate=self.spi_config['baudrate'],
-                polarity=self.spi_config['polarity'],
-                phase=self.spi_config['phase'],
-                bits=self.spi_config['bits']
-            )
-            # Dummy read to initialize
-            self.cs.value = False
-            self.spi.write_readinto(bytearray([EXT_ADC_CHANNELS[0], 0x00]), bytearray(2))
-            self.cs.value = True
-        finally:
-            self.spi.unlock()
-            time.sleep(0.001)  # Short delay after initialization
-
-    def read_external_channel(self, channel):
-        """Read value from specified external ADC channel, handling pipelined behavior."""
-        if not 0 <= channel <= 3:
-            raise ValueError("Channel must be between 0 and 3")
+    def read_external_channels_pipelined(self):
+        """Read all external ADC channels in a pipelined manner."""
+        if not 0 <= len(EXT_ADC_CHANNELS) <= 4:
+            raise ValueError("Number of channels must be between 0 and 4")
             
         # Acquire SPI bus
         while not self.spi.try_lock():
@@ -101,31 +78,33 @@ class ADCReader:
                 bits=self.spi_config['bits']
             )
             
-            # Prepare buffers
-            tx_buffer = bytearray([EXT_ADC_CHANNELS[channel], 0x00])
-            rx_buffer = bytearray(2)
+            results = []
+            current_result = bytearray(2)
             
-            # First transaction: Start conversion for desired channel
-            self.cs.value = False
-            self.spi.write_readinto(tx_buffer, rx_buffer)
+            # Pipeline all conversions
+            for channel in range(len(EXT_ADC_CHANNELS)):
+                # Deassert CS briefly between channels
+                if channel > 0:
+                    self.cs.value = True
+                    time.sleep(0.000001)  # 1µs delay
+                
+                self.cs.value = False
+                
+                # Select next channel (or dummy for last read)
+                next_channel = EXT_ADC_CHANNELS[channel + 1] if channel < len(EXT_ADC_CHANNELS) - 1 else 0x00
+                
+                # Read current channel while selecting next
+                self.spi.write_readinto(bytearray([next_channel, 0x00]), current_result)
+                
+                # Process result
+                results.append((current_result[0] & 0x0F) << 4 | (current_result[1] >> 4))
+            
             self.cs.value = True
-            
-            # Brief delay for conversion
-            time.sleep(0.000001)  # 1 microsecond delay
-            
-            # Second transaction: Read the conversion result
-            self.cs.value = False
-            self.spi.write_readinto(tx_buffer, rx_buffer)
-            self.cs.value = True
-            
-            # Extract 10-bit result
-            # First byte contains 2 bits, second byte contains 8 bits
-            result = ((rx_buffer[0] & 0x03) << 8) | rx_buffer[1]
-            return result
+            return results
             
         finally:
             self.spi.unlock()
-            time.sleep(0.001)  # Brief delay between readings
+            time.sleep(0.01)  # Brief delay between readings
 
     def read_internal_channel(self, channel):
         """Read value from internal ADC channel."""
@@ -150,26 +129,23 @@ class ADCReader:
             # Internal ADC is 16-bit (0-65535) with 3.3V reference
             return (value / 65535) * 3.3
         else:
-            # External ADC is 10-bit (0-1023) with 3.3V reference
-            return (value / 1023) * 3.3
+            # External ADC is 8-bit (0-255) with 3.3V reference
+            return (value / 255) * 3.3
 
     def read_all_channels(self):
-        """Read values from all ADC channels (external and internal) and temperature.
-        Handles pipelined behavior of external ADC."""
+        """Read values from all ADC channels (external and internal) and temperature."""
         readings = {
             'external': [],
             'internal': [],
             'temperature': self.read_temperature()
         }
         
-        # Read external channels
-        for channel in range(4):
-            try:
-                value = self.read_external_channel(channel)
-                readings['external'].append(value)
-            except Exception as e:
-                print(f"Error reading external channel {channel}: {e}")
-                readings['external'].append(None)
+        # Read external channels using pipelined approach
+        try:
+            readings['external'] = self.read_external_channels_pipelined()
+        except Exception as e:
+            print(f"Error reading external channels: {e}")
+            readings['external'] = [None] * len(EXT_ADC_CHANNELS)
         
         # Read internal channels
         for channel in range(len(self.internal_adcs)):
@@ -189,10 +165,7 @@ def format_reading(channel, value, is_internal=False, adc_reader=None):
         
     voltage = adc_reader.convert_to_voltage(value, is_internal) if adc_reader else 0
     
-    if is_internal:
-        base_str = f"Channel {channel}: Hex: 0x{value:04X}, Binary: {value:016b}, Decimal: {value}"
-    else:
-        base_str = f"Channel {channel}: Hex: 0x{value:03X}, Binary: {value:010b}, Decimal: {value}"
+    base_str = f"Channel {channel}: Hex: 0x{value:04X}, Binary: {value:08b}, Decimal: {value}"
     voltage_str = f", Voltage: {voltage:.3f}V"
     
     return base_str + voltage_str
@@ -213,12 +186,12 @@ def main():
             readings = adc.read_all_channels()
             
             # Display external readings
-            print("\nExternal ADC Readings (3.3V reference, 10-bit):")
+            print("\nExternal ADC Readings (3.3V reference):")
             for channel, value in enumerate(readings['external']):
                 print(format_reading(channel, value, False, adc))
             
             # Display internal readings
-            print("\nInternal ADC Readings (3.3V reference, 16-bit):")
+            print("\nInternal ADC Readings (3.3V reference):")
             for channel, value in enumerate(readings['internal']):
                 print(format_reading(channel, value, True, adc))
             
@@ -227,7 +200,7 @@ def main():
             print(format_temperature(readings['temperature']))
                 
             print("\n" + "-"*50)  # Separator line
-            time.sleep(0.5)
+            time.sleep(2)
             
     except KeyboardInterrupt:
         print("\nProgram terminated by user")
