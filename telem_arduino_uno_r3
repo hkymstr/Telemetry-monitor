@@ -1,0 +1,195 @@
+#include <SPI.h>
+#include <SD.h>
+
+// Hardware Configuration
+const int ADC_CS_PIN = 10;  // ADC Chip Select pin
+const int SD_CS_PIN = 9;    // SD Card Chip Select pin
+const long SPI_CLOCK = 800000;  // 800kHz clock rate for ADC
+
+// ADC Channel Configuration
+const byte ADC_CHANNELS[] = {
+  0b00001000,  // Channel 0
+  0b00010000,  // Channel 1
+  0b00001000,  // Channel 2
+  0b00000000   // Channel 3
+};
+
+// Global state variables
+bool sdCardActive = false;  // Track if SD card is working
+
+class ADCReader {
+  private:
+    int cs_pin;
+    
+  public:
+    ADCReader(int chip_select_pin) : cs_pin(chip_select_pin) {
+      pinMode(cs_pin, OUTPUT);
+      digitalWrite(cs_pin, HIGH);  // Disable ADC by default
+    }
+    
+    int readChannel(byte channel) {
+      if (channel > 3) {
+        Serial.println("Error: Channel must be between 0 and 3");
+        return -1;
+      }
+      
+      // Begin SPI transaction
+      SPI.beginTransaction(SPISettings(SPI_CLOCK, MSBFIRST, SPI_MODE0));
+      
+      digitalWrite(cs_pin, LOW);  // Enable ADC
+      
+      // Send channel selection and read result
+      byte highByte = SPI.transfer(ADC_CHANNELS[channel]);
+      byte lowByte = SPI.transfer(0x00);
+      
+      digitalWrite(cs_pin, HIGH);  // Disable ADC
+      
+      // End SPI transaction
+      SPI.endTransaction();
+      
+      // Extract and combine the result
+      int result = ((highByte & 0x0F) << 4) | (lowByte >> 4);
+      
+      delay(10);  // Brief delay between readings
+      return result;
+    }
+    
+    void readAllChannels(int* results) {
+      // Perform dummy read on channel 0 to clear buffers
+      readChannel(0);
+      delay(10);  // Give time for the channel to stabilize
+      
+      // Now perform the actual readings
+      for (int i = 0; i < 4; i++) {
+        results[i] = readChannel(i);
+      }
+    }
+};
+
+// Global ADC object
+ADCReader adc(ADC_CS_PIN);
+
+// File object for logging
+File dataFile;
+unsigned long fileCounter = 0;
+const unsigned long MAX_ROWS_PER_FILE = 1000; // Create new file after this many rows
+unsigned long currentRowCount = 0;
+
+// Create a new log file with incrementing number
+void createNewLogFile() {
+  if (!sdCardActive) {
+    return;  // Don't try to create file if SD card isn't working
+  }
+  
+  // Close the current file if it's open
+  if (dataFile) {
+    dataFile.close();
+  }
+  
+  // Create a new filename
+  char filename[13];
+  sprintf(filename, "LOG%04d.CSV", fileCounter);
+  
+  // Open new file
+  dataFile = SD.open(filename, FILE_WRITE);
+  
+  if (dataFile) {
+    // Write header row
+    dataFile.println("Timestamp,Channel0,Channel1,Channel2,Channel3");
+    dataFile.flush();
+    
+    Serial.print("Created new log file: ");
+    Serial.println(filename);
+    
+    fileCounter++;
+    currentRowCount = 0;
+  } else {
+    Serial.println("Error creating new log file!");
+    sdCardActive = false;  // Deactivate SD card functionality if file creation fails
+  }
+}
+
+void tryInitSD() {
+  pinMode(SD_CS_PIN, OUTPUT);
+  
+  Serial.print("Initializing SD card...");
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD card initialization failed!");
+    Serial.println("Continuing without SD card logging.");
+    sdCardActive = false;
+  } else {
+    Serial.println("SD card initialization successful.");
+    sdCardActive = true;
+    createNewLogFile();
+  }
+}
+
+void setup() {
+  // Initialize Serial communication
+  Serial.begin(9600);
+  while (!Serial) {
+    ; // Wait for Serial to be ready
+  }
+  
+  // Initialize SPI
+  SPI.begin();
+  
+  // Try to initialize SD card
+  tryInitSD();
+  
+  Serial.println("ADC Reader Initialized");
+}
+
+void loop() {
+  // First do all ADC readings
+  int readings[4];
+  adc.readAllChannels(readings);
+  
+  // Add delay to let MISO line stabilize after ADC operations
+  delay(10);  // 10ms delay between ADC and SD card operations
+  
+  // Get current timestamp (milliseconds since start)
+  unsigned long timestamp = millis();
+  
+  // Format data for both serial output and SD card logging
+  char dataString[50];
+  sprintf(dataString, "%lu,%d,%d,%d,%d", 
+          timestamp, readings[0], readings[1], readings[2], readings[3]);
+  
+  // Log to SD card if active
+  if (sdCardActive && dataFile) {
+    dataFile.println(dataString);
+    // Check if write was successful
+    if (!dataFile.getWriteError()) {
+      dataFile.flush();  // Make sure data is written to card
+      currentRowCount++;
+      if (currentRowCount >= MAX_ROWS_PER_FILE) {
+        createNewLogFile();
+      }
+    } else {
+      Serial.println("Write error occurred! Disabling SD card logging.");
+      sdCardActive = false;
+      dataFile.close();
+    }
+  }
+  
+  // Display readings on Serial Monitor
+  for (int channel = 0; channel < 4; channel++) {
+    Serial.print("Channel ");
+    Serial.print(channel);
+    Serial.print(": Hex: 0x");
+    Serial.print(readings[channel], HEX);
+    Serial.print(", Binary: ");
+    Serial.print(readings[channel], BIN);
+    Serial.print(", Decimal: ");
+    Serial.println(readings[channel]);
+  }
+  
+  Serial.println(dataString); // Also show the logged data string
+  if (!sdCardActive) {
+    Serial.println("(SD card logging disabled)");
+  }
+  Serial.println(); // Blank line for readability
+  
+  delay(500);      // Half second delay between readings
+}
