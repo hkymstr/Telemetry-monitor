@@ -8,10 +8,10 @@ const long SPI_CLOCK = 800000;  // 800kHz clock rate for ADC
 
 // ADC Channel Configuration
 const byte ADC_CHANNELS[] = {
-  0b00001000,  // Channel 0
-  0b00010000,  // Channel 1
-  0b00001000,  // Channel 2
-  0b00000000   // Channel 3
+  0b00000000,  // Channel 0
+  0b00001000,  // Channel 1
+  0b00010000,  // Channel 2
+  0b00011000   // Channel 3
 };
 
 // Global state variables
