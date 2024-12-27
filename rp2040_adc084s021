@@ -1,0 +1,127 @@
+import board
+import rp2pio
+import adafruit_pioasm
+import array
+import time
+from digitalio import DigitalInOut, Direction
+
+# PIO program for 16-bit continuous SPI transfer
+CONTINUOUS_SPI = """
+.program continuous_spi
+
+.wrap_target
+    set x, 15                    ; Set up counter for 16 bits
+    mov isr, null                ; Clear ISR before starting input
+bitloop:
+    set pins, 0                 ; SCK Low
+    out pins, 1    [1]         ; Output MOSI and wait
+    set pins, 1                 ; SCK High
+    in pins, 1     [1]         ; Sample MISO and wait
+    jmp x-- bitloop            ; Loop for all 16 bits
+    push                       ; Push ISR to FIFO when done
+.wrap
+"""
+
+class PIOADCReader:
+    def __init__(self, sck_pin, mosi_pin, miso_pin, cs_pin, frequency=800000):
+        """Initialize PIO-based ADC reader."""
+        self.cs = DigitalInOut(cs_pin)
+        self.cs.direction = Direction.OUTPUT
+        self.cs.value = True
+
+        # Assemble PIO program
+        self.assembled = adafruit_pioasm.assemble(CONTINUOUS_SPI)
+
+        # Create PIO StateMachine
+        self.sm = rp2pio.StateMachine(
+            self.assembled,
+            frequency=frequency*2,  # Double frequency to account for clock division
+            first_set_pin=sck_pin,  # SCK pin for set pins instruction
+            set_pin_count=1,        # Number of pins to set
+            first_out_pin=mosi_pin, # MOSI pin
+            out_pin_count=1,        # Just MOSI
+            first_in_pin=miso_pin,  # MISO pin
+            in_pin_count=1,         # Just MISO
+            auto_pull=True,         # Automatically pull data
+            pull_threshold=16,      # Pull every 16 bits
+            push_threshold=16,      # Push after collecting 16 bits
+            out_shift_right=False   # Shift left for MSB first
+        )
+        
+        # Buffer for transfers
+        self._tx_buffer = array.array('H', [0])  # 16-bit array
+        self._rx_buffer = array.array('H', [0])
+
+    def transfer16(self, data):
+        """Perform a 16-bit transfer."""
+        self._tx_buffer[0] = data & 0xFFFF  # Ensure 16-bit limit
+        
+        self.cs.value = False
+        self.sm.write(self._tx_buffer)
+        self.sm.readinto(self._rx_buffer)
+        self.cs.value = True
+        return self._rx_buffer[0]
+
+    def read_channel(self, channel):
+        """Read a specific ADC channel."""
+        if not 0 <= channel <= 3:
+            raise ValueError("Channel must be 0-3")
+            
+        channel_config = {
+            0: 0b00000000,
+            1: 0b00001000,
+            2: 0b00010000,
+            3: 0b00011000
+        }[channel]
+        
+        # Perform transfer with channel configuration in upper byte
+        result = self.transfer16((channel_config << 8) | 0x00)
+        
+        # Print raw result and bits for debugging
+        print(f"Raw result: 0x{result:04X}, Binary: {result:016b}")
+        
+        # Extract bits 4-11 and reverse them
+        value = (result >> 4) & 0xFF  # Get bits 4-11
+        # Reverse the bits
+        reversed_value = 0
+        for i in range(8):
+            if value & (1 << i):
+                reversed_value |= (1 << (7 - i))
+        
+        print(f"Extracted value: 0x{reversed_value:02X}")
+        return reversed_value
+
+    def read_all_channels(self):
+        """Read all channels in sequence."""
+        results = []
+        for channel in range(4):
+            results.append(self.read_channel(channel))
+        return results
+
+def main():
+    # Initialize PIO ADC reader
+    adc = PIOADCReader(
+        sck_pin=board.GP2,
+        mosi_pin=board.GP3,
+        miso_pin=board.GP4,
+        cs_pin=board.GP5,
+        frequency=800000
+    )
+    
+    try:
+        while True:
+            # Read all channels
+            results = adc.read_all_channels()
+            
+            # Display results
+            for channel, value in enumerate(results):
+                print(f"Channel {channel}: {value}")
+            
+            print("-" * 40)
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+
+if __name__ == "__main__":
+    main()
