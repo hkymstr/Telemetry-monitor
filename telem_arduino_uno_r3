@@ -55,14 +55,20 @@ class ADCReader {
     }
     
     void readAllChannels(int* results) {
-      // Perform dummy read on channel 0 to clear buffers
-      readChannel(0);
-      delay(10);  // Give time for the channel to stabilize
-      
-      // Now perform the actual readings
-      for (int i = 0; i < 4; i++) {
-        results[i] = readChannel(i);
-      }
+        static const int NUM_CHANNELS = 4;
+        
+        // Start sequence with dummy read to initialize
+        readChannel(0);
+        
+        // Single loop to handle all channels with pipelined reads
+        for (int i = 0; i < NUM_CHANNELS; i++) {
+            // Select next channel (wrapping back to 0 at the end)
+            int nextChannel = (i + 1) % NUM_CHANNELS;
+            
+            // Current read gets stored in previous channel's position
+            results[i] = readChannel(nextChannel);
+            delay(10);  // Keep minimum delay for stability
+        }
     }
 };
 
