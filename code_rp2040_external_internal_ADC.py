@@ -1,29 +1,27 @@
 import board
-import busio
-import digitalio
+import rp2pio
+import adafruit_pioasm
+import array
 import time
 import analogio
 import microcontroller
+from digitalio import DigitalInOut, Direction
 
-# Hardware Configuration
-SPI_CONFIG = {
-    'clock': board.GP2,
-    'mosi': board.GP3,
-    'miso': board.GP4,
-    'cs_pin': board.GP5,
-    'baudrate': 800000,
-    'polarity': 0,
-    'phase': 0,
-    'bits': 8
-}
-
-# External ADC Configuration
-EXT_ADC_CHANNELS = {
-    0: 0b00000000,
-    1: 0b00001000,
-    2: 0b00010000,
-    3: 0b00011000
-}
+# PIO program for continuous SPI communication
+CONTINUOUS_SPI = """
+.program continuous_spi
+.wrap_target
+    set x, 15                    ; Set up counter for 16 bits
+    mov isr, null                ; Clear ISR before starting input
+bitloop:
+    set pins, 0                 ; SCK Low
+    out pins, 1    [1]         ; Output MOSI and wait
+    set pins, 1                 ; SCK High
+    in pins, 1     [1]         ; Sample MISO and wait
+    jmp x-- bitloop            ; Loop for all 16 bits
+    push                       ; Push ISR to FIFO when done
+.wrap
+"""
 
 # Internal ADC pins
 INT_ADC_PINS = [
@@ -33,23 +31,42 @@ INT_ADC_PINS = [
     board.A3,  # GPIO29 / ADC3
 ]
 
-class ADCReader:
-    def __init__(self, spi_config):
-        """Initialize ADC readers with SPI configuration."""
-        # External ADC setup
-        self.spi = busio.SPI(
-            clock=spi_config['clock'],
-            MOSI=spi_config['mosi'],
-            MISO=spi_config['miso']
+class PIOADCReader:
+    def __init__(self, sck_pin, mosi_pin, miso_pin, cs_pin, frequency=800000):
+        """Initialize ADC reader with PIO-based SPI and internal ADCs."""
+        # External ADC channel configurations
+        self.channel_configs = {
+            0: 0b00000000,
+            1: 0b00001000,
+            2: 0b00010000,
+            3: 0b00011000
+        }
+        
+        # CS pin setup
+        self.cs = DigitalInOut(cs_pin)
+        self.cs.direction = Direction.OUTPUT
+        self.cs.value = True
+        
+        # PIO setup
+        self.assembled = adafruit_pioasm.assemble(CONTINUOUS_SPI)
+        self.sm = rp2pio.StateMachine(
+            self.assembled,
+            frequency=frequency*2,
+            first_set_pin=sck_pin,
+            set_pin_count=1,
+            first_out_pin=mosi_pin,
+            out_pin_count=1,
+            first_in_pin=miso_pin,
+            in_pin_count=1,
+            auto_pull=True,
+            pull_threshold=16,
+            push_threshold=16,
+            out_shift_right=False
         )
         
-        # Configure chip select pin
-        self.cs = digitalio.DigitalInOut(spi_config['cs_pin'])
-        self.cs.direction = digitalio.Direction.OUTPUT
-        self.cs.value = True  # Default CS high (disabled)
-        
-        # Store SPI configuration
-        self.spi_config = spi_config
+        # Buffers for SPI communication
+        self._tx_buffer = array.array('H', [0])
+        self._rx_buffer = array.array('H', [0])
         
         # Initialize internal ADC channels
         self.internal_adcs = []
@@ -59,52 +76,37 @@ class ADCReader:
                 self.internal_adcs.append(adc)
             except Exception as e:
                 print(f"Warning: Failed to initialize internal ADC on pin {pin}: {e}")
+        
+        # Pre-start with Ch1 to get correct pipeline order
+        self.cs.value = False
+        self._tx_buffer[0] = self.channel_configs[1] << 8
+        self.sm.write(self._tx_buffer)
+        self.cs.value = True
+        time.sleep(0.000001)
 
-    def read_external_channels_pipelined(self):
-        """Read all external ADC channels in a pipelined manner."""
-        if not 0 <= len(EXT_ADC_CHANNELS) <= 4:
-            raise ValueError("Number of channels must be between 0 and 4")
-            
-        # Acquire SPI bus
-        while not self.spi.try_lock():
-            pass
-            
-        try:
-            # Configure SPI parameters
-            self.spi.configure(
-                baudrate=self.spi_config['baudrate'],
-                polarity=self.spi_config['polarity'],
-                phase=self.spi_config['phase'],
-                bits=self.spi_config['bits']
-            )
-            
-            results = []
-            current_result = bytearray(2)
-            
-            # Pipeline all conversions
-            for channel in range(len(EXT_ADC_CHANNELS)):
-                # Deassert CS briefly between channels
-                if channel > 0:
-                    self.cs.value = True
-                    time.sleep(0.000001)  # 1µs delay
-                
-                self.cs.value = False
-                
-                # Select next channel (or dummy for last read)
-                next_channel = EXT_ADC_CHANNELS[channel + 1] if channel < len(EXT_ADC_CHANNELS) - 1 else 0x00
-                
-                # Read current channel while selecting next
-                self.spi.write_readinto(bytearray([next_channel, 0x00]), current_result)
-                
-                # Process result
-                results.append((current_result[0] & 0x0F) << 4 | (current_result[1] >> 4))
-            
+    def process_value(self, raw):
+        """Process raw ADC value into digital value and voltage."""
+        value = (raw >> 4) & 0xFF
+        digital_value = sum(((value >> i) & 1) << (7-i) for i in range(8))
+        voltage = (digital_value / 255.0) * 3.3
+        return digital_value, voltage
+
+    def read_external_channels(self):
+        """Read all external ADC channels using PIO-based SPI."""
+        results = [(0,0.0)] * 4
+        channels = [(1,0), (2,1), (3,2), (0,3)]  # (config_channel, result_channel)
+        
+        for config_ch, result_ch in channels:
+            self.cs.value = False
+            next_ch = (config_ch + 1) % 4
+            self._tx_buffer[0] = self.channel_configs[next_ch] << 8
+            self.sm.write_readinto(self._tx_buffer, self._rx_buffer)
             self.cs.value = True
-            return results
+            time.sleep(0.000001)
             
-        finally:
-            self.spi.unlock()
-            time.sleep(0.01)  # Brief delay between readings
+            results[result_ch] = self.process_value(self._rx_buffer[0])
+        
+        return results
 
     def read_internal_channel(self, channel):
         """Read value from internal ADC channel."""
@@ -113,8 +115,12 @@ class ADCReader:
         
         return self.internal_adcs[channel].value
 
+    def convert_internal_to_voltage(self, value):
+        """Convert internal ADC reading to voltage."""
+        return (value / 65535) * 3.3
+
     def read_temperature(self):
-        """Read RP2040 internal temperature sensor and return both C and F."""
+        """Read RP2040 internal temperature sensor."""
         try:
             temp_c = microcontroller.cpu.temperature
             temp_f = (temp_c * 9/5) + 32
@@ -123,62 +129,53 @@ class ADCReader:
             print(f"Error reading temperature: {e}")
             return None
 
-    def convert_to_voltage(self, value, is_internal=False):
-        """Convert ADC reading to voltage."""
-        if is_internal:
-            # Internal ADC is 16-bit (0-65535) with 3.3V reference
-            return (value / 65535) * 3.3
-        else:
-            # External ADC is 8-bit (0-255) with 3.3V reference
-            return (value / 255) * 3.3
-
     def read_all_channels(self):
-        """Read values from all ADC channels (external and internal) and temperature."""
+        """Read all channels (external and internal) and temperature."""
         readings = {
-            'external': [],
+            'external': self.read_external_channels(),
             'internal': [],
             'temperature': self.read_temperature()
         }
-        
-        # Read external channels using pipelined approach
-        try:
-            readings['external'] = self.read_external_channels_pipelined()
-        except Exception as e:
-            print(f"Error reading external channels: {e}")
-            readings['external'] = [None] * len(EXT_ADC_CHANNELS)
         
         # Read internal channels
         for channel in range(len(self.internal_adcs)):
             try:
                 value = self.read_internal_channel(channel)
-                readings['internal'].append(value)
+                voltage = self.convert_internal_to_voltage(value)
+                readings['internal'].append((value, voltage))
             except Exception as e:
                 print(f"Error reading internal channel {channel}: {e}")
-                readings['internal'].append(None)
+                readings['internal'].append((None, None))
                 
         return readings
 
-def format_reading(channel, value, is_internal=False, adc_reader=None):
-    """Format ADC reading for display with voltage conversion."""
-    if value is None:
+def format_reading(channel, value_pair, is_internal=False):
+    """Format ADC reading for display."""
+    if value_pair[0] is None:
         return f"Channel {channel}: ERROR"
-        
-    voltage = adc_reader.convert_to_voltage(value, is_internal) if adc_reader else 0
     
-    base_str = f"Channel {channel}: Hex: 0x{value:04X}, Binary: {value:08b}, Decimal: {value}"
-    voltage_str = f", Voltage: {voltage:.3f}V"
-    
-    return base_str + voltage_str
+    if is_internal:
+        raw, voltage = value_pair
+        return f"Channel {channel}: Raw: 0x{raw:04X}, Decimal: {raw}, Voltage: {voltage:.3f}V"
+    else:
+        digital_value, voltage = value_pair
+        return f"Channel {channel}: Raw: {digital_value}, Voltage: {voltage:.3f}V"
 
 def format_temperature(temp_data):
-    """Format temperature reading for display in both C and F."""
+    """Format temperature reading for display."""
     if temp_data is None:
         return "Temperature: ERROR"
     return f"CPU Temperature: {temp_data['celsius']:.1f}°C / {temp_data['fahrenheit']:.1f}°F"
 
 def main():
     """Main program loop."""
-    adc = ADCReader(SPI_CONFIG)
+    adc = PIOADCReader(
+        sck_pin=board.GP2,
+        mosi_pin=board.GP3,
+        miso_pin=board.GP4,
+        cs_pin=board.GP5,
+        frequency=800000
+    )
     
     try:
         while True:
@@ -187,20 +184,20 @@ def main():
             
             # Display external readings
             print("\nExternal ADC Readings (3.3V reference):")
-            for channel, value in enumerate(readings['external']):
-                print(format_reading(channel, value, False, adc))
+            for channel, value_pair in enumerate(readings['external']):
+                print(format_reading(channel, value_pair, False))
             
             # Display internal readings
             print("\nInternal ADC Readings (3.3V reference):")
-            for channel, value in enumerate(readings['internal']):
-                print(format_reading(channel, value, True, adc))
+            for channel, value_pair in enumerate(readings['internal']):
+                print(format_reading(channel, value_pair, True))
             
             # Display temperature
             print("\nTemperature Reading:")
             print(format_temperature(readings['temperature']))
                 
             print("\n" + "-"*50)  # Separator line
-            time.sleep(2)
+            time.sleep(1)
             
     except KeyboardInterrupt:
         print("\nProgram terminated by user")
